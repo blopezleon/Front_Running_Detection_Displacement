@@ -1,0 +1,26 @@
+{
+  "ethereum_rpc": "https://eth.llamarpc.com",
+  "polygon_rpc": "https://polygon.llamarpc.com",
+  "bsc_rpc": "https://bsc.llamarpc.com",
+  "arbitrum_rpc": "https://arb1.arbitrum.io/rpc",
+  "dune_api_key": "",
+  "etherscan_api_key": "",
+  "polygonscan_api_key": "",
+  "bscscan_api_key": "",
+  "target_tokens": [
+    "0xA0b86a33E6441E359e0DC2Db18db4ac7F08A2056",
+    "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+    "0x6B175474E89094C44Da98b954EedeAC495271d0F",
+    "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+    "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"
+  ],
+  "dex_contracts": {
+    "uniswap_v2": "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f",
+    "uniswap_v3": "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+    "sushiswap": "0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac",
+    "pancakeswap": "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73",
+    "1inch": "0x1111111254EEB25477B68fb85Ed929f73A960582"
+  },
+  "block_range": 1000,
+  "max_concurrent_requests": 10
+}
