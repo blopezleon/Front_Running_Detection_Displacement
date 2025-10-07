@@ -1,11 +1,11 @@
 # Front-Running Detection with RAG PyTorch Model
 
-A comprehensive system for collecting cryptocurrency transaction data and detecting front-running attacks using a Retrieval-Augmented Generation (RAG) PyTorch model.
+A comprehensive system for collecting Ethereum transaction data and detecting front-running attacks using a Retrieval-Augmented Generation (RAG) PyTorch model.
 
 ## 🎯 Overview
 
 This project provides tools to:
-- Collect real-time cryptocurrency transaction data from multiple chains (Ethereum, Polygon, BSC, Arbitrum)
+- Collect real-time Ethereum transaction data from the Ethereum mainnet
 - Detect MEV (Maximal Extractable Value) opportunities including sandwich attacks, arbitrage, and liquidations
 - Train a RAG-based PyTorch model for front-running detection
 - Analyze patterns and generate comprehensive reports
@@ -31,7 +31,7 @@ This project provides tools to:
 ## 🚀 Features
 
 ### Data Collection (`get_data.py`)
-- **Multi-chain Support**: Ethereum, Polygon, BSC, Arbitrum
+- **Ethereum Mainnet**: Focused on Ethereum mainnet data collection
 - **Real-time Data**: Latest block monitoring and historical data collection
 - **MEV Detection**: Automatic detection of sandwich attacks, arbitrage, and liquidations
 - **Concurrent Processing**: Async/await pattern for efficient data collection
@@ -70,7 +70,13 @@ Edit `config.json` to add your API keys and adjust settings:
   "ethereum_rpc": "https://eth.llamarpc.com",
   "dune_api_key": "your_dune_api_key",
   "etherscan_api_key": "your_etherscan_api_key",
-  "target_tokens": ["0xA0b86a33E6441E359e0DC2Db18db4ac7F08A2056"],
+  "target_tokens": [
+    "0xA0b86a33E6441E359e0DC2Db18db4ac7F08A2056",
+    "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+    "0x6B175474E89094C44Da98b954EedeAC495271d0F",
+    "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+    "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"
+  ],
   "max_concurrent_requests": 10
 }
 ```
@@ -82,7 +88,7 @@ Edit `config.json` to add your API keys and adjust settings:
 python get_data.py
 ```
 This will:
-- Connect to blockchain RPCs
+- Connect to Ethereum mainnet RPC
 - Collect transaction data from recent blocks
 - Detect MEV opportunities
 - Store data in `crypto_data.db`
@@ -149,8 +155,7 @@ CREATE TABLE transactions (
     value REAL,
     gas_price INTEGER,
     gas_used INTEGER,
-    timestamp DATETIME,
-    chain_id INTEGER
+    timestamp DATETIME
 );
 ```
 

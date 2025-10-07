@@ -17,7 +17,7 @@ plt.style.use('seaborn-v0_8')
 sns.set_palette("husl")
 
 class DataAnalyzer:
-    """Class for analyzing collected cryptocurrency and MEV data"""
+    """Class for analyzing collected Ethereum and MEV data"""
     
     def __init__(self, db_path: str = "crypto_data.db"):
         self.db_path = db_path
@@ -235,7 +235,7 @@ class DataAnalyzer:
         fig.update_layout(
             height=800,
             showlegend=True,
-            title_text="Cryptocurrency Front-Running Analysis Dashboard",
+            title_text="Ethereum Front-Running Analysis Dashboard",
             title_x=0.5
         )
         
@@ -307,7 +307,7 @@ class DataAnalyzer:
         <!DOCTYPE html>
         <html>
         <head>
-            <title>Crypto Front-Running Analysis Report</title>
+            <title>Ethereum Front-Running Analysis Report</title>
             <style>
                 body {{ font-family: Arial, sans-serif; margin: 40px; }}
                 .header {{ text-align: center; color: #2c3e50; }}
@@ -320,7 +320,7 @@ class DataAnalyzer:
         </head>
         <body>
             <div class="header">
-                <h1>Cryptocurrency Front-Running Analysis Report</h1>
+                <h1>Ethereum Front-Running Analysis Report</h1>
                 <p>Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
             </div>
             
@@ -413,7 +413,7 @@ def main():
         return
     
     # Generate summary statistics
-    print("=== CRYPTOCURRENCY FRONT-RUNNING ANALYSIS ===\n")
+    print("=== ETHEREUM FRONT-RUNNING ANALYSIS ===\n")
     
     stats = analyzer.generate_summary_stats()
     

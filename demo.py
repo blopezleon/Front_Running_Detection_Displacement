@@ -19,15 +19,15 @@ def print_banner():
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║                    🔍 FRONT-RUNNING DETECTION SYSTEM 🔍                     ║
 ║                                                                              ║
-║   A comprehensive RAG-based PyTorch model for detecting crypto front-runs   ║
+║    A RAG-based PyTorch model for detecting Ethereum front-running attacks   ║
 ║                                                                              ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
     """
     print(banner)
 
 async def collect_sample_data():
-    """Collect sample data for demonstration"""
-    logger.info("🔄 Starting data collection...")
+    """Collect sample Ethereum data for demonstration"""
+    logger.info("🔄 Starting Ethereum data collection...")
     
     try:
         from get_data import CryptoDataCollector
@@ -35,7 +35,7 @@ async def collect_sample_data():
         # Initialize collector
         collector = CryptoDataCollector()
         
-        # Collect data from latest 3 blocks (small sample for demo)
+        # Collect data from latest 3 blocks on Ethereum (small sample for demo)
         await collector.collect_latest_data(num_blocks=3, chain_id=1)
         
         # Export data for training

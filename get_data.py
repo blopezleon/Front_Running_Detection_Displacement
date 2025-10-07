@@ -4,7 +4,6 @@ import aiohttp
 import pandas as pd
 import numpy as np
 from web3 import Web3
-from web3.middleware import geth_poa_middleware
 from datetime import datetime, timedelta
 import json
 import time
@@ -54,7 +53,7 @@ class MEVOpportunity:
     timestamp: datetime
 
 class CryptoDataCollector:
-    """Main class for collecting cryptocurrency data for front-running detection"""
+    """Main class for collecting Ethereum data for front-running detection"""
     
     def __init__(self, config_path: str = "config.json"):
         """Initialize the data collector with configuration"""
@@ -62,6 +61,8 @@ class CryptoDataCollector:
         self.web3_clients = {}
         self.session = None
         self.db_path = "crypto_data.db"
+        self.current_rpc = None
+        self.rpc_index = 0
         self._setup_database()
         self._setup_web3_clients()
     
@@ -69,13 +70,14 @@ class CryptoDataCollector:
         """Load configuration from JSON file"""
         default_config = {
             "ethereum_rpc": "https://eth.llamarpc.com",
-            "polygon_rpc": "https://polygon.llamarpc.com",
-            "bsc_rpc": "https://bsc.llamarpc.com",
-            "arbitrum_rpc": "https://arb1.arbitrum.io/rpc",
+            "fallback_rpcs": [
+                "https://rpc.ankr.com/eth",
+                "https://ethereum.publicnode.com",
+                "https://eth.rpc.blxrbdn.com",
+                "https://cloudflare-eth.com"
+            ],
             "dune_api_key": "",
             "etherscan_api_key": "",
-            "polygonscan_api_key": "",
-            "bscscan_api_key": "",
             "target_tokens": [
                 "0xA0b86a33E6441E359e0DC2Db18db4ac7F08A2056",  # USDC
                 "0xdAC17F958D2ee523a2206206994597C13D831ec7",  # USDT
@@ -87,11 +89,13 @@ class CryptoDataCollector:
                 "uniswap_v2": "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f",
                 "uniswap_v3": "0x1F98431c8aD98523631AE4a59f267346ea31F984",
                 "sushiswap": "0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac",
-                "pancakeswap": "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73",
                 "1inch": "0x1111111254EEB25477B68fb85Ed929f73A960582"
             },
             "block_range": 1000,
-            "max_concurrent_requests": 10
+            "max_concurrent_requests": 2,
+            "request_delay": 0.5,
+            "retry_attempts": 3,
+            "retry_delay": 2
         }
         
         if os.path.exists(config_path):
@@ -127,8 +131,7 @@ class CryptoDataCollector:
                 timestamp DATETIME,
                 input_data TEXT,
                 nonce INTEGER,
-                status INTEGER,
-                chain_id INTEGER
+                status INTEGER
             )
         ''')
         
@@ -146,8 +149,7 @@ class CryptoDataCollector:
                 backrun_tx_hash TEXT,
                 dex_name TEXT,
                 token_addresses TEXT,
-                timestamp DATETIME,
-                chain_id INTEGER
+                timestamp DATETIME
             )
         ''')
         
@@ -162,8 +164,7 @@ class CryptoDataCollector:
                 gas_used INTEGER,
                 gas_limit INTEGER,
                 base_fee REAL,
-                transaction_count INTEGER,
-                chain_id INTEGER
+                transaction_count INTEGER
             )
         ''')
         
@@ -173,8 +174,7 @@ class CryptoDataCollector:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 token_address TEXT,
                 price_usd REAL,
-                timestamp DATETIME,
-                chain_id INTEGER
+                timestamp DATETIME
             )
         ''')
         
@@ -183,27 +183,29 @@ class CryptoDataCollector:
         logger.info("Database setup completed")
     
     def _setup_web3_clients(self):
-        """Setup Web3 clients for different chains"""
-        chains = {
-            1: self.config["ethereum_rpc"],
-            137: self.config["polygon_rpc"],
-            56: self.config["bsc_rpc"],
-            42161: self.config["arbitrum_rpc"]
-        }
+        """Setup Web3 client for Ethereum with fallback RPCs"""
+        # Try primary RPC first
+        rpcs_to_try = [self.config["ethereum_rpc"]]
         
-        for chain_id, rpc_url in chains.items():
+        # Add fallback RPCs if available
+        if "fallback_rpcs" in self.config:
+            rpcs_to_try.extend(self.config["fallback_rpcs"])
+        
+        for rpc_url in rpcs_to_try:
             try:
-                w3 = Web3(Web3.HTTPProvider(rpc_url))
-                if chain_id in [137, 56]:  # Polygon and BSC use PoA
-                    w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+                w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={'timeout': 60}))
                 
                 if w3.is_connected():
-                    self.web3_clients[chain_id] = w3
-                    logger.info(f"Connected to chain {chain_id}")
-                else:
-                    logger.error(f"Failed to connect to chain {chain_id}")
+                    self.web3_clients[1] = w3
+                    self.current_rpc = rpc_url
+                    logger.info(f"✅ Connected to Ethereum mainnet via {rpc_url}")
+                    return
             except Exception as e:
-                logger.error(f"Error connecting to chain {chain_id}: {e}")
+                logger.warning(f"⚠️  Failed to connect to {rpc_url}: {e}")
+                continue
+        
+        logger.error("❌ Failed to connect to any Ethereum RPC endpoint")
+        raise ConnectionError("Could not connect to Ethereum network")
     
     @asynccontextmanager
     async def get_session(self):
@@ -219,7 +221,11 @@ class CryptoDataCollector:
             raise ValueError(f"Chain {chain_id} not supported")
         
         w3 = self.web3_clients[chain_id]
-        return w3.eth.block_number
+        # Run synchronous web3 call in executor
+        loop = asyncio.get_event_loop()
+        block_number = await loop.run_in_executor(None, lambda: w3.eth.block_number)
+        logger.info(f"📍 Latest Ethereum block: {block_number}")
+        return block_number
     
     async def get_block_data(self, block_number: int, chain_id: int = 1) -> Dict:
         """Get detailed block data including all transactions"""
@@ -228,7 +234,12 @@ class CryptoDataCollector:
         
         w3 = self.web3_clients[chain_id]
         try:
-            block = w3.eth.get_block(block_number, full_transactions=True)
+            logger.info(f"🔄 Fetching block {block_number}...")
+            # Run synchronous web3 call in executor to avoid blocking
+            loop = asyncio.get_event_loop()
+            block = await loop.run_in_executor(None, lambda: w3.eth.get_block(block_number, full_transactions=True))
+            
+            logger.info(f"✅ Block {block_number} fetched: {len(block.transactions)} transactions")
             return {
                 'block_number': block.number,
                 'block_hash': block.hash.hex(),
@@ -241,7 +252,7 @@ class CryptoDataCollector:
                 'transaction_count': len(block.transactions)
             }
         except Exception as e:
-            logger.error(f"Error fetching block {block_number}: {e}")
+            logger.error(f"❌ Error fetching block {block_number}: {e}")
             return None
     
     def extract_transaction_data(self, tx, block_timestamp: datetime, chain_id: int = 1) -> TransactionData:
@@ -263,25 +274,66 @@ class CryptoDataCollector:
         )
     
     async def get_transaction_receipts(self, tx_hashes: List[str], chain_id: int = 1) -> Dict[str, Dict]:
-        """Get transaction receipts for multiple transactions"""
+        """Get transaction receipts for multiple transactions with rate limiting"""
         if chain_id not in self.web3_clients:
             raise ValueError(f"Chain {chain_id} not supported")
         
         w3 = self.web3_clients[chain_id]
         receipts = {}
+        loop = asyncio.get_event_loop()
         
-        for tx_hash in tx_hashes:
-            try:
-                receipt = w3.eth.get_transaction_receipt(tx_hash)
-                receipts[tx_hash] = {
-                    'gas_used': receipt.gasUsed,
-                    'status': receipt.status,
-                    'logs': receipt.logs
-                }
-            except Exception as e:
-                logger.warning(f"Failed to get receipt for {tx_hash}: {e}")
+        # Get rate limiting settings
+        request_delay = self.config.get('request_delay', 0.3)
+        retry_attempts = self.config.get('retry_attempts', 3)
+        retry_delay = self.config.get('retry_delay', 2)
+        
+        logger.info(f"📥 Fetching {len(tx_hashes)} transaction receipts (with {request_delay}s delay)...")
+        
+        for i, tx_hash in enumerate(tx_hashes):
+            success = False
+            
+            for attempt in range(retry_attempts):
+                try:
+                    # Add delay between requests to avoid rate limiting
+                    if i > 0:
+                        await asyncio.sleep(request_delay)
+                    
+                    # Run synchronous web3 call in executor
+                    receipt = await loop.run_in_executor(
+                        None, 
+                        lambda tx=tx_hash: w3.eth.get_transaction_receipt(tx)
+                    )
+                    
+                    receipts[tx_hash] = {
+                        'gas_used': receipt.gasUsed,
+                        'status': receipt.status,
+                        'logs': receipt.logs
+                    }
+                    success = True
+                    
+                    if (i + 1) % 25 == 0:
+                        logger.info(f"   Progress: {i+1}/{len(tx_hashes)} receipts...")
+                    break
+                    
+                except Exception as e:
+                    if '429' in str(e) or 'Too Many Requests' in str(e):
+                        if attempt < retry_attempts - 1:
+                            wait_time = retry_delay * (attempt + 1)
+                            logger.warning(f"⚠️  Rate limited, waiting {wait_time}s before retry {attempt+2}/{retry_attempts}...")
+                            await asyncio.sleep(wait_time)
+                        else:
+                            logger.warning(f"⚠️  Skipping receipt for {tx_hash[:10]}... after {retry_attempts} attempts")
+                            receipts[tx_hash] = {'gas_used': 0, 'status': 0, 'logs': []}
+                    else:
+                        logger.warning(f"⚠️  Error getting receipt: {e}")
+                        receipts[tx_hash] = {'gas_used': 0, 'status': 0, 'logs': []}
+                        break
+            
+            if not success:
                 receipts[tx_hash] = {'gas_used': 0, 'status': 0, 'logs': []}
         
+        success_count = sum(1 for r in receipts.values() if r['gas_used'] > 0)
+        logger.info(f"✅ Fetched {success_count}/{len(receipts)} receipts successfully")
         return receipts
     
     async def detect_mev_opportunities(self, block_data: Dict, chain_id: int = 1) -> List[MEVOpportunity]:
@@ -477,7 +529,7 @@ class CryptoDataCollector:
         # For now, return target tokens as placeholder
         return self.config['target_tokens'][:2]  # Return first 2 as example
     
-    async def save_transactions_to_db(self, transactions: List[TransactionData], chain_id: int):
+    async def save_transactions_to_db(self, transactions: List[TransactionData], chain_id: int = 1):
         """Save transaction data to database"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -486,20 +538,20 @@ class CryptoDataCollector:
             cursor.execute('''
                 INSERT OR REPLACE INTO transactions 
                 (block_number, transaction_hash, transaction_index, from_address, to_address,
-                 value, gas_price, gas_used, gas_limit, timestamp, input_data, nonce, status, chain_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 value, gas_price, gas_used, gas_limit, timestamp, input_data, nonce, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 tx.block_number, tx.transaction_hash, tx.transaction_index,
                 tx.from_address, tx.to_address, tx.value, tx.gas_price,
                 tx.gas_used, tx.gas_limit, tx.timestamp, tx.input_data,
-                tx.nonce, tx.status, chain_id
+                tx.nonce, tx.status
             ))
         
         conn.commit()
         conn.close()
         logger.info(f"Saved {len(transactions)} transactions to database")
     
-    async def save_mev_opportunities_to_db(self, opportunities: List[MEVOpportunity], chain_id: int):
+    async def save_mev_opportunities_to_db(self, opportunities: List[MEVOpportunity], chain_id: int = 1):
         """Save MEV opportunities to database"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -509,13 +561,13 @@ class CryptoDataCollector:
                 INSERT INTO mev_opportunities
                 (block_number, mev_type, profit_usd, gas_cost_usd, net_profit_usd,
                  victim_tx_hash, frontrun_tx_hash, backrun_tx_hash, dex_name,
-                 token_addresses, timestamp, chain_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 token_addresses, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 opp.block_number, opp.mev_type, opp.profit_usd, opp.gas_cost_usd,
                 opp.net_profit_usd, opp.victim_tx_hash, opp.frontrun_tx_hash,
                 opp.backrun_tx_hash, opp.dex_name, json.dumps(opp.token_addresses),
-                opp.timestamp, chain_id
+                opp.timestamp
             ))
         
         conn.commit()
@@ -675,12 +727,12 @@ async def main():
     
     try:
         # Collect data from latest 5 blocks on Ethereum
-        logger.info("Starting data collection...")
+        logger.info("Starting Ethereum data collection...")
         await collector.collect_latest_data(num_blocks=5, chain_id=1)
         
         # Export data for training
         file_paths = collector.export_data_for_training()
-        logger.info("Data collection completed!")
+        logger.info("Ethereum data collection completed!")
         logger.info(f"Exported files: {list(file_paths.keys())}")
         
     except Exception as e:
@@ -690,5 +742,5 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main()):)
+    asyncio.run(main())
 
