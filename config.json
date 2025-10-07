@@ -1,5 +1,5 @@
 {
-  "_comment": "No API keys needed! Using free public Ethereum RPCs with automatic fallback",
+  "_comment": "Optimized for speed while avoiding rate limits",
   "ethereum_rpc": "https://eth.llamarpc.com",
   "fallback_rpcs": [
     "https://rpc.ankr.com/eth",
@@ -24,8 +24,8 @@
     "1inch": "0x1111111254EEB25477B68fb85Ed929f73A960582"
   },
   "block_range": 1000,
-  "max_concurrent_requests": 2,
-  "request_delay": 0.5,
-  "retry_attempts": 3,
-  "retry_delay": 2
+  "max_concurrent_requests": 3,
+  "batch_size": 20,
+  "retry_attempts": 2,
+  "retry_delay": 1
 }

@@ -274,63 +274,65 @@ class CryptoDataCollector:
         )
     
     async def get_transaction_receipts(self, tx_hashes: List[str], chain_id: int = 1) -> Dict[str, Dict]:
-        """Get transaction receipts for multiple transactions with rate limiting"""
+        """Get transaction receipts in parallel batches with rate limiting"""
         if chain_id not in self.web3_clients:
             raise ValueError(f"Chain {chain_id} not supported")
         
         w3 = self.web3_clients[chain_id]
         receipts = {}
-        loop = asyncio.get_event_loop()
         
-        # Get rate limiting settings
-        request_delay = self.config.get('request_delay', 0.3)
+        # Get settings
+        batch_size = self.config.get('batch_size', 10)  # Process 10 at a time
         retry_attempts = self.config.get('retry_attempts', 3)
-        retry_delay = self.config.get('retry_delay', 2)
+        retry_delay = self.config.get('retry_delay', 1)
         
-        logger.info(f"📥 Fetching {len(tx_hashes)} transaction receipts (with {request_delay}s delay)...")
+        logger.info(f"📥 Fetching {len(tx_hashes)} receipts in batches of {batch_size}...")
         
-        for i, tx_hash in enumerate(tx_hashes):
-            success = False
+        # Process in batches for better performance
+        for batch_start in range(0, len(tx_hashes), batch_size):
+            batch_end = min(batch_start + batch_size, len(tx_hashes))
+            batch = tx_hashes[batch_start:batch_end]
             
-            for attempt in range(retry_attempts):
-                try:
-                    # Add delay between requests to avoid rate limiting
-                    if i > 0:
-                        await asyncio.sleep(request_delay)
-                    
-                    # Run synchronous web3 call in executor
-                    receipt = await loop.run_in_executor(
-                        None, 
-                        lambda tx=tx_hash: w3.eth.get_transaction_receipt(tx)
-                    )
-                    
-                    receipts[tx_hash] = {
-                        'gas_used': receipt.gasUsed,
-                        'status': receipt.status,
-                        'logs': receipt.logs
-                    }
-                    success = True
-                    
-                    if (i + 1) % 25 == 0:
-                        logger.info(f"   Progress: {i+1}/{len(tx_hashes)} receipts...")
-                    break
-                    
-                except Exception as e:
-                    if '429' in str(e) or 'Too Many Requests' in str(e):
-                        if attempt < retry_attempts - 1:
-                            wait_time = retry_delay * (attempt + 1)
-                            logger.warning(f"⚠️  Rate limited, waiting {wait_time}s before retry {attempt+2}/{retry_attempts}...")
-                            await asyncio.sleep(wait_time)
-                        else:
-                            logger.warning(f"⚠️  Skipping receipt for {tx_hash[:10]}... after {retry_attempts} attempts")
-                            receipts[tx_hash] = {'gas_used': 0, 'status': 0, 'logs': []}
-                    else:
-                        logger.warning(f"⚠️  Error getting receipt: {e}")
-                        receipts[tx_hash] = {'gas_used': 0, 'status': 0, 'logs': []}
-                        break
+            # Process batch in parallel with semaphore
+            semaphore = asyncio.Semaphore(batch_size)
             
-            if not success:
-                receipts[tx_hash] = {'gas_used': 0, 'status': 0, 'logs': []}
+            async def fetch_receipt(tx_hash: str):
+                async with semaphore:
+                    for attempt in range(retry_attempts):
+                        try:
+                            loop = asyncio.get_event_loop()
+                            receipt = await loop.run_in_executor(
+                                None,
+                                lambda: w3.eth.get_transaction_receipt(tx_hash)
+                            )
+                            return tx_hash, {
+                                'gas_used': receipt.gasUsed,
+                                'status': receipt.status,
+                                'logs': receipt.logs
+                            }
+                        except Exception as e:
+                            if '429' in str(e) or 'Too Many Requests' in str(e):
+                                if attempt < retry_attempts - 1:
+                                    await asyncio.sleep(retry_delay * (attempt + 1))
+                                else:
+                                    return tx_hash, {'gas_used': 0, 'status': 0, 'logs': []}
+                            else:
+                                return tx_hash, {'gas_used': 0, 'status': 0, 'logs': []}
+                    return tx_hash, {'gas_used': 0, 'status': 0, 'logs': []}
+            
+            # Fetch batch in parallel
+            batch_results = await asyncio.gather(*[fetch_receipt(tx) for tx in batch])
+            
+            # Store results
+            for tx_hash, receipt_data in batch_results:
+                receipts[tx_hash] = receipt_data
+            
+            # Progress update
+            logger.info(f"   Progress: {len(receipts)}/{len(tx_hashes)} receipts...")
+            
+            # Small delay between batches to avoid overwhelming the RPC
+            if batch_end < len(tx_hashes):
+                await asyncio.sleep(0.1)
         
         success_count = sum(1 for r in receipts.values() if r['gas_used'] > 0)
         logger.info(f"✅ Fetched {success_count}/{len(receipts)} receipts successfully")

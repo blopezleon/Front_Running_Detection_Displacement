@@ -1,0 +1,1 @@
+id,block_number,mev_type,profit_usd,gas_cost_usd,net_profit_usd,victim_tx_hash,frontrun_tx_hash,backrun_tx_hash,dex_name,token_addresses,timestamp
