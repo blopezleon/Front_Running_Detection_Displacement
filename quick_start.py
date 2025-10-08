@@ -56,13 +56,20 @@ def check_dependencies():
 async def collect_ethereum_data(num_blocks=10):
     """Collect Ethereum data using free public RPC"""
     logger.info(f"📊 Starting collection of {num_blocks} Ethereum blocks...")
-    logger.info("⏳ This will take a few minutes...\n")
     
     try:
         from get_data import CryptoDataCollector
         
         # Initialize collector (uses free public RPC by default)
         collector = CryptoDataCollector()
+        
+        # Show current database stats
+        stats = collector.get_database_stats()
+        if stats['total_blocks'] > 0:
+            logger.info(f"📦 Database contains {stats['total_blocks']} blocks, {stats['total_transactions']:,} transactions")
+            logger.info(f"   Block range: {stats['block_range'][0]} to {stats['block_range'][1]}")
+            logger.info(f"   MEV opportunities: {stats['mev_opportunities']}")
+            logger.info("   ℹ️  Will skip already collected blocks\n")
         
         # Collect data from latest blocks
         await collector.collect_latest_data(num_blocks=num_blocks, chain_id=1)

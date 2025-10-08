@@ -1,5 +1,10 @@
 {
-  "_comment": "Optimized for speed while avoiding rate limits",
+  "_comment": "Optimized for maximum speed with rate limit protection",
+  "_speed_profiles": {
+    "aggressive": "max_concurrent_requests=5, batch_size=30 (fastest, may hit limits)",
+    "balanced": "max_concurrent_requests=3, batch_size=20 (recommended)",
+    "conservative": "max_concurrent_requests=2, batch_size=10 (safest, slower)"
+  },
   "ethereum_rpc": "https://eth.llamarpc.com",
   "fallback_rpcs": [
     "https://rpc.ankr.com/eth",

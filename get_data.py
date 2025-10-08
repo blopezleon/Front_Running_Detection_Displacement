@@ -8,13 +8,15 @@ from datetime import datetime, timedelta
 import json
 import time
 import logging
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Set
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import sqlite3
 from contextlib import asynccontextmanager
+from tqdm.asyncio import tqdm as async_tqdm
+from tqdm import tqdm
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -273,8 +275,8 @@ class CryptoDataCollector:
             status=1  # Will be updated from receipt
         )
     
-    async def get_transaction_receipts(self, tx_hashes: List[str], chain_id: int = 1) -> Dict[str, Dict]:
-        """Get transaction receipts in parallel batches with rate limiting"""
+    async def get_transaction_receipts(self, tx_hashes: List[str], chain_id: int = 1, pbar: Optional[tqdm] = None) -> Dict[str, Dict]:
+        """Get transaction receipts in parallel batches with rate limiting and progress bar"""
         if chain_id not in self.web3_clients:
             raise ValueError(f"Chain {chain_id} not supported")
         
@@ -282,11 +284,16 @@ class CryptoDataCollector:
         receipts = {}
         
         # Get settings
-        batch_size = self.config.get('batch_size', 10)  # Process 10 at a time
-        retry_attempts = self.config.get('retry_attempts', 3)
+        batch_size = self.config.get('batch_size', 20)
+        retry_attempts = self.config.get('retry_attempts', 2)
         retry_delay = self.config.get('retry_delay', 1)
         
-        logger.info(f"📥 Fetching {len(tx_hashes)} receipts in batches of {batch_size}...")
+        # Create progress bar for receipts if not provided
+        if pbar is None:
+            pbar = tqdm(total=len(tx_hashes), desc="  📥 Receipts", unit="tx", leave=False)
+            own_pbar = True
+        else:
+            own_pbar = False
         
         # Process in batches for better performance
         for batch_start in range(0, len(tx_hashes), batch_size):
@@ -323,19 +330,21 @@ class CryptoDataCollector:
             # Fetch batch in parallel
             batch_results = await asyncio.gather(*[fetch_receipt(tx) for tx in batch])
             
-            # Store results
+            # Store results and update progress
             for tx_hash, receipt_data in batch_results:
                 receipts[tx_hash] = receipt_data
-            
-            # Progress update
-            logger.info(f"   Progress: {len(receipts)}/{len(tx_hashes)} receipts...")
+                pbar.update(1)
             
             # Small delay between batches to avoid overwhelming the RPC
             if batch_end < len(tx_hashes):
                 await asyncio.sleep(0.1)
         
+        if own_pbar:
+            pbar.close()
+        
         success_count = sum(1 for r in receipts.values() if r['gas_used'] > 0)
-        logger.info(f"✅ Fetched {success_count}/{len(receipts)} receipts successfully")
+        success_rate = (success_count / len(receipts) * 100) if receipts else 0
+        logger.info(f"  ✅ {success_count}/{len(receipts)} receipts ({success_rate:.1f}% success)")
         return receipts
     
     async def detect_mev_opportunities(self, block_data: Dict, chain_id: int = 1) -> List[MEVOpportunity]:
@@ -531,6 +540,54 @@ class CryptoDataCollector:
         # For now, return target tokens as placeholder
         return self.config['target_tokens'][:2]  # Return first 2 as example
     
+    def get_collected_blocks(self) -> Set[int]:
+        """Get set of block numbers already in database"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('SELECT DISTINCT block_number FROM transactions ORDER BY block_number')
+            blocks = {row[0] for row in cursor.fetchall()}
+            conn.close()
+            return blocks
+        except Exception as e:
+            logger.warning(f"Could not read existing blocks: {e}")
+            return set()
+    
+    def get_database_stats(self) -> Dict:
+        """Get current database statistics"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('SELECT COUNT(*) FROM transactions')
+            tx_count = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT COUNT(DISTINCT block_number) FROM transactions')
+            block_count = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT MIN(block_number), MAX(block_number) FROM transactions')
+            min_block, max_block = cursor.fetchone()
+            
+            cursor.execute('SELECT COUNT(*) FROM mev_opportunities')
+            mev_count = cursor.fetchone()[0]
+            
+            conn.close()
+            
+            return {
+                'total_transactions': tx_count,
+                'total_blocks': block_count,
+                'block_range': (min_block, max_block) if min_block else (None, None),
+                'mev_opportunities': mev_count
+            }
+        except Exception as e:
+            logger.warning(f"Could not get database stats: {e}")
+            return {
+                'total_transactions': 0,
+                'total_blocks': 0,
+                'block_range': (None, None),
+                'mev_opportunities': 0
+            }
+    
     async def save_transactions_to_db(self, transactions: List[TransactionData], chain_id: int = 1):
         """Save transaction data to database"""
         conn = sqlite3.connect(self.db_path)
@@ -576,11 +633,29 @@ class CryptoDataCollector:
         conn.close()
         logger.info(f"Saved {len(opportunities)} MEV opportunities to database")
     
-    async def collect_block_range_data(self, start_block: int, end_block: int, chain_id: int = 1):
-        """Collect data for a range of blocks"""
-        logger.info(f"Collecting data for blocks {start_block} to {end_block} on chain {chain_id}")
+    async def collect_block_range_data(self, start_block: int, end_block: int, chain_id: int = 1, skip_existing: bool = True):
+        """Collect data for a range of blocks with progress tracking"""
+        
+        # Get already collected blocks
+        existing_blocks = self.get_collected_blocks() if skip_existing else set()
+        
+        # Filter out already collected blocks
+        blocks_to_collect = [b for b in range(start_block, end_block + 1) if b not in existing_blocks]
+        
+        if not blocks_to_collect:
+            logger.info(f"✅ All blocks {start_block} to {end_block} already collected!")
+            return
+        
+        if existing_blocks:
+            logger.info(f"📊 Found {len(existing_blocks)} blocks already in database")
+            logger.info(f"📥 Collecting {len(blocks_to_collect)} new blocks ({start_block} to {end_block})")
+        else:
+            logger.info(f"📥 Collecting {len(blocks_to_collect)} blocks ({start_block} to {end_block})")
         
         semaphore = asyncio.Semaphore(self.config['max_concurrent_requests'])
+        
+        # Create progress bar for blocks
+        pbar = tqdm(total=len(blocks_to_collect), desc="🔄 Blocks", unit="block", position=0)
         
         async def process_block(block_number: int):
             async with semaphore:
@@ -588,6 +663,7 @@ class CryptoDataCollector:
                     # Get block data
                     block_data = await self.get_block_data(block_number, chain_id)
                     if not block_data:
+                        pbar.update(1)
                         return
                     
                     # Extract transaction data
@@ -599,7 +675,8 @@ class CryptoDataCollector:
                         transactions.append(tx_data)
                         tx_hashes.append(tx.hash.hex())
                     
-                    # Get transaction receipts
+                    # Get transaction receipts with progress
+                    pbar.set_description(f"🔄 Block {block_number} ({len(tx_hashes)} txs)")
                     receipts = await self.get_transaction_receipts(tx_hashes, chain_id)
                     
                     # Update transaction data with receipt information
@@ -617,14 +694,20 @@ class CryptoDataCollector:
                     if mev_opportunities:
                         await self.save_mev_opportunities_to_db(mev_opportunities, chain_id)
                     
-                    logger.info(f"Processed block {block_number}: {len(transactions)} txs, {len(mev_opportunities)} MEV ops")
+                    # Update progress
+                    pbar.set_postfix({'txs': len(transactions), 'MEV': len(mev_opportunities)})
+                    pbar.update(1)
                     
                 except Exception as e:
-                    logger.error(f"Error processing block {block_number}: {e}")
+                    logger.error(f"❌ Error processing block {block_number}: {e}")
+                    pbar.update(1)
         
         # Process blocks concurrently
-        tasks = [process_block(block_num) for block_num in range(start_block, end_block + 1)]
+        tasks = [process_block(block_num) for block_num in blocks_to_collect]
         await asyncio.gather(*tasks, return_exceptions=True)
+        
+        pbar.close()
+        logger.info(f"✅ Collection complete! Processed {len(blocks_to_collect)} blocks")
     
     async def collect_latest_data(self, num_blocks: int = 10, chain_id: int = 1):
         """Collect data from the latest blocks"""
