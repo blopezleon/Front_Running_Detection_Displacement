@@ -354,8 +354,10 @@ class TransactionLabeler:
     Converts raw transactions into labeled training examples for ML models.
     """
     
-    def __init__(self, db_path: str = "crypto_data.db"):
+    def __init__(self, db_path: str = "data/crypto_data.db"):
         self.db_path = db_path
+        # Ensure data directory exists
+        Path("data").mkdir(exist_ok=True)
         
     def label_block_transactions(self, 
                                  block_number: int,
@@ -777,9 +779,9 @@ Examples:
     parser.add_argument(
         '--output',
         type=str,
-        default='labeled_training_data.csv',
+        default='data/labeled_training_data.csv',
         metavar='FILE',
-        help='Output CSV file (default: labeled_training_data.csv)'
+        help='Output CSV file (default: data/labeled_training_data.csv)'
     )
     
     parser.add_argument(

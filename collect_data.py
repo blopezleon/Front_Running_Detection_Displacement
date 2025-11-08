@@ -26,9 +26,11 @@ logger = logging.getLogger(__name__)
 class ContinuousDataCollector:
     """Continuously collects Ethereum blockchain data"""
     
-    def __init__(self, db_path: str = "crypto_data.db"):
+    def __init__(self, db_path: str = "data/crypto_data.db"):
         self.db_path = db_path
         self.should_stop = False
+        # Ensure data directory exists
+        Path("data").mkdir(exist_ok=True)
         self.blocks_collected = 0
         self.start_time = None
         

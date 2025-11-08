@@ -11,12 +11,10 @@ ENV/
 dist/
 build/
 
-# Database files (too large for git)
-crypto_data.db
-*.db
+# Data directory (databases, CSVs, analysis results)
+data/
 
-# Training data and labels (too large for git)
-labeled_training_data.csv
+# Old training data folder
 training_data/
 
 # Model files (can be large)
