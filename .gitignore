@@ -15,6 +15,10 @@ build/
 crypto_data.db
 *.db
 
+# Training data and labels (too large for git)
+labeled_training_data.csv
+training_data/
+
 # Model files (can be large)
 best_rag_model.pt
 rag_model/
