@@ -1,0 +1,3 @@
+[submodule "flashboys2"]
+	path = flashboys2
+	url = https://github.com/pdaian/flashboys2.git
