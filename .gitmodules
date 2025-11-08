@@ -1,3 +1,6 @@
 [submodule "flashboys2"]
 	path = flashboys2
 	url = https://github.com/pdaian/flashboys2.git
+[submodule "mempool-dumpster"]
+	path = mempool-dumpster
+	url = https://github.com/flashbots/mempool-dumpster.git
