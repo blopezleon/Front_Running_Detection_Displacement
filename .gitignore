@@ -43,3 +43,5 @@ Thumbs.db
 # Log files
 *.log
 
+# models
+models
