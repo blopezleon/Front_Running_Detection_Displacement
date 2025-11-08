@@ -1,0 +1,14 @@
+# Flash Boys 2.0 MEV Detection - Required Dependencies
+# ====================================================
+
+# Ethereum & Blockchain
+web3>=6.0.0              # Ethereum blockchain interaction
+
+# Async Network
+aiohttp>=3.8.0          # Async HTTP for data collection
+
+# Data Processing
+pandas>=2.0.0           # Data manipulation and CSV handling
+numpy>=1.24.0           # Numerical operations
+
+# That's it. Everything else is Python built-ins (sqlite3, datetime, etc)
