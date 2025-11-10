@@ -55,6 +55,12 @@ model_performance = {
     'false_negative': 0   # Model predicted clean, Flashboys found MEV
 }
 
+# Fixed threshold - adaptive was causing wild oscillations
+adaptive_threshold = 0.92  # Fixed threshold
+threshold_lock = threading.Lock()
+# Track per-block detection rates for comparison (for display only)
+recent_block_rate_diffs = deque(maxlen=5)  # Store last 5 blocks: (ml_rate - fb_rate)
+
 
 def check_flashboys_heuristic_mempool(tx: Dict[str, Any]) -> bool:
     """
@@ -376,6 +382,9 @@ def block_monitor_thread(ws_url: str, stop_event: threading.Event):
 
 
 def run_live_scoring(ws_url: str, threshold: float = 0.9, lookback: int = 50, models_dir: str = 'models'):
+    global adaptive_threshold
+    adaptive_threshold = threshold  # Initialize with command line threshold
+    
     model, scaler, feature_cols = load_artifacts(models_dir)
     w3 = init_web3(ws_url)
 
@@ -426,9 +435,11 @@ def run_live_scoring(ws_url: str, threshold: float = 0.9, lookback: int = 50, mo
                      title=f"[bold]Flashboys Mempool Analysis (Per Block)[/bold] | Last {len(blocks_list)} blocks")
         table.add_column("Block", justify="right", width=10)
         table.add_column("Total TXs", justify="right", width=10)
-        table.add_column("FB Match", justify="right", width=10)
-        table.add_column("Rate", justify="right", width=8)
-        table.add_column("Sample TX (Hash | Gas | Logs)", width=60)
+        table.add_column("FB Rate", justify="right", width=8)
+        table.add_column("ML Rate", justify="right", width=8)
+        table.add_column("FB Count", justify="right", width=10)
+        table.add_column("ML Count", justify="right", width=10)
+        table.add_column("Sample TX (Hash | Gas | Logs)", width=50)
         
         # Show all blocks (up to 50)
         for block_data in reversed(blocks_list):  # Most recent at top
@@ -436,7 +447,29 @@ def run_live_scoring(ws_url: str, threshold: float = 0.9, lookback: int = 50, mo
             total = block_data['total_txs']
             fb_count_block = block_data['fb_count']
             fb_txs = block_data['flashboys_txs']
-            rate = (100 * fb_count_block / max(1, total))
+            fb_rate = (100 * fb_count_block / max(1, total))
+            
+            # Calculate ML alert rate for this block's transactions
+            ml_alert_count = 0
+            with performance_lock:
+                for tx_hash in [tx['hash'][:16] for tx in fb_txs] if fb_txs else []:
+                    # Find matching transactions in mempool_tx_data
+                    for stored_hash, (_, was_alert, _, _) in mempool_tx_data.items():
+                        if stored_hash.startswith(tx_hash.replace("...", "")):
+                            if was_alert:
+                                ml_alert_count += 1
+                            break
+            
+            # Actually, let's calculate ML alerts for ALL txs in this block period
+            block_start_time = block_data.get('timestamp', 0) - 30.0
+            block_end_time = block_data.get('timestamp', 0)
+            ml_alerts_in_period = 0
+            with performance_lock:
+                for _, (tx_rec, was_alert, _, tx_time) in mempool_tx_data.items():
+                    if block_start_time <= tx_time <= block_end_time and was_alert:
+                        ml_alerts_in_period += 1
+            
+            ml_rate = (100 * ml_alerts_in_period / max(1, total))
             
             # Show first flashboys tx as sample
             if fb_txs:
@@ -445,16 +478,20 @@ def run_live_scoring(ws_url: str, threshold: float = 0.9, lookback: int = 50, mo
                 table.add_row(
                     f"[cyan]{block_num}[/cyan]",
                     str(total),
+                    f"[green]{fb_rate:.1f}%[/green]" if fb_count_block > 0 else "[dim]0%[/dim]",
+                    f"[cyan]{ml_rate:.1f}%[/cyan]" if ml_alerts_in_period > 0 else "[dim]0%[/dim]",
                     f"[bold green]{fb_count_block}[/bold green]" if fb_count_block > 0 else "0",
-                    f"[green]{rate:.1f}%[/green]" if fb_count_block > 0 else "[dim]0%[/dim]",
+                    f"[bold cyan]{ml_alerts_in_period}[/bold cyan]" if ml_alerts_in_period > 0 else "0",
                     f"[dim]{sample_str}[/dim]"
                 )
             else:
                 table.add_row(
                     f"[dim]{block_num}[/dim]",
                     str(total),
-                    "0",
                     "[dim]0%[/dim]",
+                    f"[cyan]{ml_rate:.1f}%[/cyan]" if ml_alerts_in_period > 0 else "[dim]0%[/dim]",
+                    "0",
+                    f"[bold cyan]{ml_alerts_in_period}[/bold cyan]" if ml_alerts_in_period > 0 else "0",
                     "[dim]No MEV detected[/dim]"
                 )
         
@@ -542,6 +579,8 @@ def run_live_scoring(ws_url: str, threshold: float = 0.9, lookback: int = 50, mo
     
     def render_stats():
         """Render statistics panel"""
+        global adaptive_threshold, recent_block_rate_diffs
+        
         with blocks_lock:
             blocks_list = list(recent_blocks)
         
@@ -554,6 +593,34 @@ def run_live_scoring(ws_url: str, threshold: float = 0.9, lookback: int = 50, mo
         fb_rate = (100 * total_fb_real / max(1, len(mempool_tx_data))) if mempool_tx_data else 0.0
         ml_rate = (100 * alert_count / max(1, tx_count))
         diff = abs(ml_rate - fb_rate)
+        
+        # Track rate differences for display (no longer adjusting threshold)
+        # Store the rate difference from the most recent block
+        if len(blocks_list) > 0:
+            latest_block = blocks_list[-1]
+            block_total = latest_block['total_txs']
+            block_fb_count = latest_block['fb_count']
+            
+            # ONLY track blocks with enough transactions (ignore tiny blocks)
+            if block_total >= 100:  # Require at least 100 txs for valid sample
+                block_fb_rate = 100 * block_fb_count / block_total
+                
+                # Calculate ML rate for this specific block
+                block_start_time = latest_block.get('timestamp', 0) - 30.0
+                block_end_time = latest_block.get('timestamp', 0)
+                block_ml_count = 0
+                with performance_lock:
+                    for _, (tx_rec, was_alert, _, tx_time) in mempool_tx_data.items():
+                        if block_start_time <= tx_time <= block_end_time and was_alert:
+                            block_ml_count += 1
+                
+                block_ml_rate = 100 * block_ml_count / block_total
+                rate_diff = block_ml_rate - block_fb_rate
+                
+                # Store this block's rate difference (for display only)
+                recent_block_rate_diffs.append(rate_diff)
+        
+        # Threshold is now FIXED - no more adjustments
         
         # Model performance metrics
         tp = perf['true_positive']
@@ -582,11 +649,14 @@ def run_live_scoring(ws_url: str, threshold: float = 0.9, lookback: int = 50, mo
         stats_table.add_column("Performance", justify="left", style="green")
         stats_table.add_column("Confusion Matrix", justify="left", style="yellow")
         
+        with threshold_lock:
+            current_threshold = adaptive_threshold
+        
         stats_table.add_row(
             f"{tx_count} txs\n{alert_count} ML alerts ({ml_rate:.2f}%)",
             f"{len(blocks_list)} blocks analyzed\n{len(mempool_tx_data)} unique txs evaluated\n{total_fb_real} auctions ({fb_rate:.2f}%)",
             f"Score: {score:+d}\nAccuracy: {accuracy:.1f}%\nPrecision: {precision:.1f}%\nRecall: {recall:.1f}%\nAgreement: {agreement:.1f}%",
-            f"TP={tp}  FP={fp}\nTN={tn}  FN={fn}\nEvaluated: {total_evaluated}\nThreshold: {threshold:.4f}"
+            f"TP={tp}  FP={fp}\nTN={tn}  FN={fn}\nEvaluated: {total_evaluated}\nThreshold: {current_threshold:.4f} (fixed)"
         )
         
         return Panel(stats_table, border_style="yellow", title="[bold yellow]Statistics: ML vs Flashboys[/bold yellow]")
@@ -650,7 +720,11 @@ def run_live_scoring(ws_url: str, threshold: float = 0.9, lookback: int = 50, mo
                         except Exception:
                             score = float(model.predict_proba(X_scaled)[:, 1][0])
 
-                        is_alert = score >= threshold
+                        # Use adaptive threshold for alerts
+                        with threshold_lock:
+                            current_threshold = adaptive_threshold
+                        
+                        is_alert = score >= current_threshold
                         if is_alert:
                             alert_count += 1
                             reason = generate_alert_reason(feat_dict, score)
@@ -705,7 +779,7 @@ def run_live_scoring(ws_url: str, threshold: float = 0.9, lookback: int = 50, mo
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--ws', default=os.environ.get('WEB3_WS'), help='Websocket URL for an Ethereum node (env WEB3_WS)')
-    parser.add_argument('--threshold', type=float, default=0.94, help='Detection threshold')
+    parser.add_argument('--threshold', type=float, default=0.948, help='Detection threshold')
     parser.add_argument('--lookback', type=int, default=50)
     parser.add_argument('--models-dir', default='models')
     args = parser.parse_args()
