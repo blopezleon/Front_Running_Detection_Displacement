@@ -3,6 +3,7 @@ import time
 import argparse
 import pickle
 import logging
+import threading
 from collections import deque, defaultdict
 from typing import Deque, Dict, Any, List
 
@@ -14,6 +15,8 @@ from rich.console import Console
 from rich.table import Table
 from rich.live import Live
 from rich import box
+from rich.layout import Layout
+from rich.panel import Panel
 
 # Load .env file if it exists
 try:
@@ -25,6 +28,106 @@ except ImportError:
 console = Console()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Flashboys2 heuristic constants (REAL implementation from the paper)
+FLASHBOYS_HIGH_GAS_THRESHOLD = 50_000_000_000  # 50 gwei (lowered from original 310 for modern mempool)
+FLASHBOYS_EXCLUDED_ADDRESSES = [
+    "0xa62142888aba8370742be823c1782d17a0389da1",
+    "0xdd9fd6b6f8f7ea932997992bbe67eabb3e316f3c"
+]
+
+# Global state for block monitoring
+recent_blocks = deque(maxlen=20)  # Store last 20 blocks of mempool analysis
+blocks_lock = threading.Lock()
+current_block_num = 0  # Track block number for analysis
+
+# Track mempool transactions (rolling window for auction detection)
+current_block_txs = deque(maxlen=2000)  # Rolling mempool window (last ~60 seconds)
+current_block_txs_lock = threading.Lock()
+
+# Model performance tracking  
+mempool_tx_data = {}  # hash -> (tx_record, is_alert, score, timestamp)
+performance_lock = threading.Lock()
+model_performance = {
+    'true_positive': 0,   # Model predicted MEV, Flashboys confirmed
+    'false_positive': 0,  # Model predicted MEV, Flashboys rejected
+    'true_negative': 0,   # Model predicted clean, Flashboys confirmed
+    'false_negative': 0   # Model predicted clean, Flashboys found MEV
+}
+
+
+def check_flashboys_heuristic_mempool(tx: Dict[str, Any]) -> bool:
+    """
+    Simplified flashboys2 heuristic for mempool transactions.
+    Only checks high gas price (can't see gas_used or logs until mined)
+    """
+    gas_price = tx.get('gasPrice') or 0
+    to_addr = (tx.get('to') or '').lower()
+    
+    is_high_gas = gas_price >= FLASHBOYS_HIGH_GAS_THRESHOLD
+    is_not_excluded = to_addr not in FLASHBOYS_EXCLUDED_ADDRESSES
+    
+    return is_high_gas and is_not_excluded
+
+
+def check_auction_labeler_real(tx_data: Dict[str, Any], all_block_txs: List[Dict[str, Any]], 
+                                time_window: float = 2.5, min_price_escalation: float = 1.03) -> bool:
+    """
+    ACTUAL labeling used in training (AuctionLabeler from train_mev_detector_improved.py).
+    
+    This is what was ACTUALLY used to create the training labels, NOT flashboys!
+    
+    Detects gas auctions by checking:
+    1. Multiple txs to same target within time window (2.5 seconds)
+    2. Gas price escalation (each tx >= 1.03x previous)
+    OR
+    3. Nonce replacements (same sender + same nonce)
+    """
+    current_to = (tx_data.get('to') or '').lower()
+    current_from = tx_data.get('from', '').lower()
+    current_nonce = tx_data.get('nonce', -1)
+    current_gas = float(tx_data.get('gasPrice', 0))
+    current_time = tx_data.get('ts', 0)  # Fixed: use 'ts' not 'timestamp'
+    
+    if current_to == '0x0':
+        return False
+    
+    # Find candidates: same target OR same sender+nonce
+    candidates = []
+    has_nonce_replacement = False
+    
+    for other_tx in all_block_txs:
+        other_to = (other_tx.get('to') or '').lower()
+        other_from = other_tx.get('from', '').lower()
+        other_nonce = other_tx.get('nonce', -1)
+        other_time = other_tx.get('ts', 0)  # Fixed: use 'ts' not 'timestamp'
+        other_gas = float(other_tx.get('gasPrice', 0))
+        
+        # Check time window
+        if abs(other_time - current_time) > time_window:
+            continue
+        
+        # Same target or same sender+nonce
+        same_target = other_to == current_to
+        same_sender_nonce = (other_from == current_from and other_nonce == current_nonce)
+        
+        if same_target or same_sender_nonce:
+            candidates.append((other_time, other_gas))
+            if same_sender_nonce and other_time != current_time:
+                has_nonce_replacement = True
+    
+    if len(candidates) < 2:  # min_auction_size=2
+        return False
+    
+    # Sort by time and check gas escalation
+    candidates.sort()
+    gas_prices = [g for _, g in candidates]
+    is_escalating = all(
+        gas_prices[k + 1] >= gas_prices[k] * min_price_escalation
+        for k in range(len(gas_prices) - 1)
+    )
+    
+    return is_escalating or has_nonce_replacement
 
 
 def load_artifacts(models_dir: str = "models"):
@@ -42,7 +145,8 @@ def load_artifacts(models_dir: str = "models"):
     with open(features_path, 'r') as f:
         feature_cols = [l.strip() for l in f if l.strip()]
 
-    logger.info(f"Loaded model ({model_path.name}), scaler and {len(feature_cols)} features")
+    # Don't log during live display - causes corruption
+    # logger.info(f"Loaded model ({model_path.name}), scaler and {len(feature_cols)} features")
     return model, scaler, feature_cols
 
 
@@ -62,7 +166,8 @@ def init_web3(ws_url: str) -> Web3:
     w3 = Web3(provider)
     if not w3.is_connected():
         raise ConnectionError(f"Unable to connect to {ws_url}")
-    logger.info("Connected to Web3 provider")
+    # Don't log during live display - causes corruption
+    # logger.info("Connected to Web3 provider")
     return w3
 
 
@@ -190,6 +295,86 @@ def generate_alert_reason(feat_dict: Dict[str, float], score: float) -> str:
     return " | ".join(reasons) if reasons else "Pattern detected"
 
 
+def block_monitor_thread(ws_url: str, stop_event: threading.Event):
+    """
+    Monitor new blocks - when block completes, analyze recent MEMPOOL txs using AuctionLabeler.
+    Uses a sliding time window (last 30 seconds of mempool) to detect auction patterns.
+    """
+    w3_blocks = init_web3(ws_url)
+    block_filter = w3_blocks.eth.filter('latest')
+    
+    global current_block_num
+    
+    while not stop_event.is_set():
+        try:
+            new_blocks = block_filter.get_new_entries()
+            for block_hash in new_blocks:
+                current_block_num += 1
+                block_time = time.time()
+                
+                # Get recent mempool txs (last 30 seconds) for auction detection
+                with current_block_txs_lock:
+                    # Filter to transactions from last 30 seconds
+                    cutoff_time = block_time - 30.0
+                    recent_mempool = [tx for tx in current_block_txs if tx.get('ts', 0) >= cutoff_time]
+                    
+                    # Keep mempool data for next block (don't clear - we need rolling window)
+                    # But remove very old txs (older than 60 seconds)
+                    old_cutoff = block_time - 60.0
+                    while current_block_txs and current_block_txs[0].get('ts', 0) < old_cutoff:
+                        current_block_txs.popleft()
+                
+                if not recent_mempool:
+                    continue
+                
+                # Run AuctionLabeler on recent mempool data to detect auctions
+                flashboys_txs = []
+                for tx_data in recent_mempool:
+                    try:
+                        tx_hash_full = tx_data['hash']
+                        is_flashboys = check_auction_labeler_real(tx_data, recent_mempool, 
+                                                       time_window=2.5, min_price_escalation=1.03)
+                        
+                        # Compare with ML prediction
+                        with performance_lock:
+                            if tx_hash_full in mempool_tx_data:
+                                _, was_alert, score, _ = mempool_tx_data[tx_hash_full]
+                                if was_alert and is_flashboys:
+                                    model_performance['true_positive'] += 1
+                                elif was_alert and not is_flashboys:
+                                    model_performance['false_positive'] += 1
+                                elif not was_alert and is_flashboys:
+                                    model_performance['false_negative'] += 1
+                                elif not was_alert and not is_flashboys:
+                                    model_performance['true_negative'] += 1
+                        
+                        if is_flashboys:
+                            flashboys_txs.append({
+                                'hash': tx_data['hash'][:16] + "...",
+                                'from': tx_data.get('from', '')[:10] + "...",
+                                'to': tx_data.get('to', '0x0')[:10] + "...",
+                                'gas_price': float(tx_data.get('gasPrice', 0)) / 1e9,
+                                'nonce': tx_data.get('nonce', -1)
+                            })
+                    except Exception:
+                        continue
+                
+                # Store block analysis
+                with blocks_lock:
+                    recent_blocks.append({
+                        'number': current_block_num,
+                        'timestamp': block_time,
+                        'total_txs': len(recent_mempool),
+                        'flashboys_txs': flashboys_txs,
+                        'fb_count': len(flashboys_txs)
+                    })
+        
+        except Exception:
+            pass
+        
+        time.sleep(0.1)
+
+
 def run_live_scoring(ws_url: str, threshold: float = 0.9, lookback: int = 50, models_dir: str = 'models'):
     model, scaler, feature_cols = load_artifacts(models_dir)
     w3 = init_web3(ws_url)
@@ -197,27 +382,92 @@ def run_live_scoring(ws_url: str, threshold: float = 0.9, lookback: int = 50, mo
     # Sliding buffer of recent txs
     buffer: Deque[Dict[str, Any]] = deque(maxlen=1000)
 
-    # We subscribe to pending transactions
+    # Wait for next block to synchronize start
+    block_filter = w3.eth.filter('latest')
+    current_block = w3.eth.block_number
+    while True:
+        new_blocks = block_filter.get_new_entries()
+        if new_blocks:
+            break
+        time.sleep(0.1)
+    
+    # Now subscribe to pending transactions - synced with block
     sub = w3.eth.filter('pending')
     
     # Stats tracking
     tx_count = 0
     alert_count = 0
     
-    # Store last 60 transactions with scores for display
-    recent_txs = deque(maxlen=60)
+    # Store last 25 transactions with scores for display
+    recent_txs = deque(maxlen=25)
     
-    console.print("[bold green]Live MEV Detector Started[/bold green]")
-    console.print(f"Threshold: {threshold:.4f} | Lookback: {lookback}\n")
+    # Block monitoring will start AFTER warmup completes
+    stop_event = threading.Event()
+    block_thread = None
+    
+    # Don't print to console - it corrupts the Live display
+    # The status will be shown in the panel titles
+
+    def render_blocks_table():
+        """Render the flashboys analysis of mempool data per block"""
+        with blocks_lock:
+            blocks_list = list(recent_blocks)
+        
+        if not blocks_list:
+            table = Table(show_header=True, header_style="bold magenta", box=box.ROUNDED, 
+                         title="[bold]Flashboys Mempool Analysis (Per Block)[/bold] | Waiting for blocks...")
+            table.add_column("Block", width=10)
+            table.add_column("Status", width=30)
+            table.add_row("[dim]---[/dim]", "[yellow]Waiting for next block...[/yellow]")
+            return table
+        
+        # Create table
+        table = Table(show_header=True, header_style="bold magenta", box=box.ROUNDED,
+                     title=f"[bold]Flashboys Mempool Analysis (Per Block)[/bold] | Last {len(blocks_list)} blocks")
+        table.add_column("Block", justify="right", width=10)
+        table.add_column("Total TXs", justify="right", width=10)
+        table.add_column("FB Match", justify="right", width=10)
+        table.add_column("Rate", justify="right", width=8)
+        table.add_column("Sample TX (Hash | Gas | Logs)", width=60)
+        
+        # Show all blocks (up to 50)
+        for block_data in reversed(blocks_list):  # Most recent at top
+            block_num = block_data['number']
+            total = block_data['total_txs']
+            fb_count_block = block_data['fb_count']
+            fb_txs = block_data['flashboys_txs']
+            rate = (100 * fb_count_block / max(1, total))
+            
+            # Show first flashboys tx as sample
+            if fb_txs:
+                sample = fb_txs[0]
+                sample_str = f"{sample['hash']} | {sample['gas_price']:.1f}gwei | nonce:{sample.get('nonce', 'N/A')}"
+                table.add_row(
+                    f"[cyan]{block_num}[/cyan]",
+                    str(total),
+                    f"[bold green]{fb_count_block}[/bold green]" if fb_count_block > 0 else "0",
+                    f"[green]{rate:.1f}%[/green]" if fb_count_block > 0 else "[dim]0%[/dim]",
+                    f"[dim]{sample_str}[/dim]"
+                )
+            else:
+                table.add_row(
+                    f"[dim]{block_num}[/dim]",
+                    str(total),
+                    "0",
+                    "[dim]0%[/dim]",
+                    "[dim]No MEV detected[/dim]"
+                )
+        
+        return table
 
     def render_table():
         """Render the current state of recent transactions"""
         warmup_remaining = max(0, lookback - len(buffer))
         if warmup_remaining > 0:
-            title = f"[bold]Live Mempool Feed[/bold] | Warming up... ({len(buffer)}/{lookback})"
+            status_text = f"Warming up... ({len(buffer)}/{lookback})"
         else:
             alert_pct = 100 * alert_count / max(1, tx_count)
-            title = f"[bold]Live Mempool Feed[/bold] | Total: {tx_count} | Alerts: {alert_count} ({alert_pct:.2f}%)"
+            status_text = f"Total: {tx_count} | ML Alerts: {alert_count} ({alert_pct:.2f}%)"
         
         # Get terminal width and calculate column widths dynamically
         term_width = console.width
@@ -233,7 +483,7 @@ def run_live_scoring(ws_url: str, threshold: float = 0.9, lookback: int = 50, mo
         score_width = max(8, int(available_width * 0.10))
         status_width = max(15, available_width - hash_width - from_width - to_width - gas_width - score_width - 8)
         
-        table = Table(show_header=True, header_style="bold cyan", box=box.ROUNDED, title=title, expand=True)
+        table = Table(show_header=True, header_style="bold cyan", box=box.ROUNDED, expand=True)
         table.add_column("#", style="dim", width=6)
         table.add_column("Hash", width=hash_width)
         table.add_column("From", width=from_width)
@@ -242,12 +492,14 @@ def run_live_scoring(ws_url: str, threshold: float = 0.9, lookback: int = 50, mo
         table.add_column("Score", justify="right", width=score_width)
         table.add_column("Status", width=status_width)
         
+        # Show all transactions (up to 50)
         for tx_data in reversed(recent_txs):  # Most recent at top
             tx_num = tx_data['num']
             tx_rec = tx_data['tx']
             score = tx_data['score']
             is_alert = tx_data['is_alert']
             reason = tx_data.get('reason', '')
+            fb_match = tx_data.get('fb_match', False)
             
             hash_short = tx_rec['hash'][:16] + "..."
             from_short = (tx_rec['from'][:10] + "..." if tx_rec['from'] else "N/A")
@@ -287,9 +539,77 @@ def run_live_scoring(ws_url: str, threshold: float = 0.9, lookback: int = 50, mo
                 )
         
         return table
+    
+    def render_stats():
+        """Render statistics panel"""
+        with blocks_lock:
+            blocks_list = list(recent_blocks)
+        
+        with performance_lock:
+            perf = model_performance.copy()
+        
+        # Calculate statistics - use UNIQUE evaluated transactions, not overlapping block windows
+        total_fb_real = sum(b['fb_count'] for b in blocks_list)
+        # Don't sum total_txs across blocks - they overlap! Use the actual evaluated count instead
+        fb_rate = (100 * total_fb_real / max(1, len(mempool_tx_data))) if mempool_tx_data else 0.0
+        ml_rate = (100 * alert_count / max(1, tx_count))
+        diff = abs(ml_rate - fb_rate)
+        
+        # Model performance metrics
+        tp = perf['true_positive']
+        fp = perf['false_positive']
+        tn = perf['true_negative']
+        fn = perf['false_negative']
+        total_evaluated = tp + fp + tn + fn
+        
+        if total_evaluated > 0:
+            accuracy = 100 * (tp + tn) / total_evaluated
+            precision = 100 * tp / max(1, tp + fp)
+            recall = 100 * tp / max(1, tp + fn)
+            agreement = 100 * (tp + tn) / total_evaluated
+            # Fixed scoring: Weight TP more, don't double-penalize
+            score = (tp * 2) - fp - fn  # +2 for catching MEV, -1 for each error
+        else:
+            accuracy = precision = recall = agreement = 0.0
+            score = 0
+        
+        # Horizontal table for statistics
+        from rich.table import Table as StatsTable
+        stats_table = StatsTable(show_header=True, box=box.SIMPLE, expand=True)
+        
+        stats_table.add_column("Mempool", justify="left", style="cyan")
+        stats_table.add_column("Flashboys", justify="left", style="magenta")
+        stats_table.add_column("Performance", justify="left", style="green")
+        stats_table.add_column("Confusion Matrix", justify="left", style="yellow")
+        
+        stats_table.add_row(
+            f"{tx_count} txs\n{alert_count} ML alerts ({ml_rate:.2f}%)",
+            f"{len(blocks_list)} blocks analyzed\n{len(mempool_tx_data)} unique txs evaluated\n{total_fb_real} auctions ({fb_rate:.2f}%)",
+            f"Score: {score:+d}\nAccuracy: {accuracy:.1f}%\nPrecision: {precision:.1f}%\nRecall: {recall:.1f}%\nAgreement: {agreement:.1f}%",
+            f"TP={tp}  FP={fp}\nTN={tn}  FN={fn}\nEvaluated: {total_evaluated}\nThreshold: {threshold:.4f}"
+        )
+        
+        return Panel(stats_table, border_style="yellow", title="[bold yellow]Statistics: ML vs Flashboys[/bold yellow]")
+
+    def render_combined():
+        """Render both mempool and blocks tables stacked with colored panels"""
+        from rich.console import Group
+        
+        # Get status for panel title
+        warmup_remaining = max(0, lookback - len(buffer))
+        if warmup_remaining > 0:
+            mempool_title = f"[bold cyan]Mempool Feed[/bold cyan] | Warming up... ({len(buffer)}/{lookback})"
+        else:
+            alert_pct = 100 * alert_count / max(1, tx_count)
+            mempool_title = f"[bold cyan]Mempool Feed[/bold cyan] | Total: {tx_count} | Alerts: {alert_count} ({alert_pct:.2f}%)"
+        
+        mempool_panel = Panel(render_table(), border_style="cyan", title=mempool_title)
+        blocks_panel = Panel(render_blocks_table(), border_style="magenta", title="[bold magenta]Flashboys Analysis (Mempool Data)[/bold magenta]")
+        stats_panel = render_stats()
+        return Group(mempool_panel, blocks_panel, stats_panel)
 
     try:
-        with Live(render_table(), refresh_per_second=4, console=console) as live:
+        with Live(render_combined(), refresh_per_second=2, console=console) as live:
             while True:
                 hashes = sub.get_new_entries()
                 for h in hashes:
@@ -313,6 +633,11 @@ def run_live_scoring(ws_url: str, threshold: float = 0.9, lookback: int = 50, mo
                     buffer.append(tx_record)
                     tx_count += 1
 
+                    # Start block monitoring AFTER warmup completes (silently to avoid corrupting Live display)
+                    if len(buffer) == lookback and block_thread is None:
+                        block_thread = threading.Thread(target=block_monitor_thread, args=(ws_url, stop_event), daemon=True)
+                        block_thread.start()
+
                     # Only start scoring once we have at least `lookback` items
                     if len(buffer) >= lookback:
                         feat_dict = compute_features(tx_record, buffer, lookback, feature_cols)
@@ -332,7 +657,15 @@ def run_live_scoring(ws_url: str, threshold: float = 0.9, lookback: int = 50, mo
                         else:
                             reason = ""
                         
-                        # Add to recent transactions
+                        # Store for block analysis AND performance tracking
+                        with performance_lock:
+                            mempool_tx_data[tx_record['hash']] = (tx_record, is_alert, score, arrival_ts)
+                        
+                        # Add to current block's mempool collection
+                        with current_block_txs_lock:
+                            current_block_txs.append(tx_record)
+                        
+                        # Add to recent transactions for display
                         tx_data = {
                             'num': tx_count,
                             'tx': tx_record,
@@ -355,12 +688,13 @@ def run_live_scoring(ws_url: str, threshold: float = 0.9, lookback: int = 50, mo
                         recent_txs.append(tx_data)
                     
                     # Update the live display
-                    live.update(render_table())
+                    live.update(render_combined())
 
                 time.sleep(0.05)
     except KeyboardInterrupt:
+        stop_event.set()  # Stop the block monitor thread
         console.print(f"\n\n[bold yellow]Stopped by user[/bold yellow]")
-        console.print(f"Total txs: {tx_count} | Alerts: {alert_count} ({100*alert_count/max(1,tx_count):.2f}%)")
+
     finally:
         try:
             w3.provider.disconnect()
@@ -371,7 +705,7 @@ def run_live_scoring(ws_url: str, threshold: float = 0.9, lookback: int = 50, mo
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--ws', default=os.environ.get('WEB3_WS'), help='Websocket URL for an Ethereum node (env WEB3_WS)')
-    parser.add_argument('--threshold', type=float, default=0.94, help='Detection threshold (default: 0.935)')
+    parser.add_argument('--threshold', type=float, default=0.94, help='Detection threshold')
     parser.add_argument('--lookback', type=int, default=50)
     parser.add_argument('--models-dir', default='models')
     args = parser.parse_args()
