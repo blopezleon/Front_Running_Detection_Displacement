@@ -1,8 +1,3 @@
-"""
-Analyze when the model detects MEV transactions within auctions.
-Shows detection timing: early, middle, or late in auction sequences.
-"""
-
 import pandas as pd
 import numpy as np
 from pathlib import Path

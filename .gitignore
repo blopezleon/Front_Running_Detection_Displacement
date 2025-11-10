@@ -45,3 +45,6 @@ Thumbs.db
 
 # models
 models
+
+# api key
+.env
