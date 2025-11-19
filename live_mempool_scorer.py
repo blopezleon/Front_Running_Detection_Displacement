@@ -128,12 +128,18 @@ def check_auction_labeler_real(tx_data: Dict[str, Any], all_block_txs: List[Dict
     # Sort by time and check gas escalation
     candidates.sort()
     gas_prices = [g for _, g in candidates]
-    is_escalating = all(
-        gas_prices[k + 1] >= gas_prices[k] * min_price_escalation
-        for k in range(len(gas_prices) - 1)
-    )
     
-    return is_escalating or has_nonce_replacement
+    # Modified to detect "clumps" and overall escalation rather than strict steps
+    # This captures the entire auction sequence, not just the final winner
+    min_gas = min(gas_prices)
+    max_gas = max(gas_prices)
+    price_spread = max_gas / (min_gas + 1e-9)
+    is_escalating = price_spread >= min_price_escalation
+    
+    # Also consider large groups as auctions (high contention)
+    is_large_clump = len(candidates) >= 4
+    
+    return is_escalating or has_nonce_replacement or is_large_clump
 
 
 def load_artifacts(models_dir: str = "models"):
@@ -779,7 +785,7 @@ def run_live_scoring(ws_url: str, threshold: float = 0.9, lookback: int = 50, mo
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--ws', default=os.environ.get('WEB3_WS'), help='Websocket URL for an Ethereum node (env WEB3_WS)')
-    parser.add_argument('--threshold', type=float, default=0.948, help='Detection threshold')
+    parser.add_argument('--threshold', type=float, default=0.61, help='Detection threshold')
     parser.add_argument('--lookback', type=int, default=50)
     parser.add_argument('--models-dir', default='models')
     args = parser.parse_args()

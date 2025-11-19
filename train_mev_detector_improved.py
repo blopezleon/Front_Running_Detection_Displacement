@@ -83,14 +83,18 @@ class FlashBoysLabeler:
                 
                 base_time = time_arr[idx]
                 max_time = base_time + self.time_window
-                window_end = min(idx + 200, len(df))  # Larger search window
+                window_end = min(idx + 1000, len(df))  # Increased window for large clumps
                 
                 candidates = []
                 has_nonce_replacement = False
                 
                 for i in range(idx, window_end):
-                    if processed[i] or time_arr[i] > max_time:
+                    if processed[i]:
                         continue
+                    
+                    # Optimization: stop if we're past the time window
+                    if time_arr[i] > max_time:
+                        break
                     
                     same_target = to_arr[i] == target
                     same_sender_nonce = from_arr[i] == current_from and nonce_arr[i] == current_nonce
@@ -105,12 +109,16 @@ class FlashBoysLabeler:
                     continue
                 
                 gas_prices = gas_arr[candidates]
-                is_escalating = all(
-                    gas_prices[k + 1] >= gas_prices[k] * self.min_price_escalation
-                    for k in range(len(gas_prices) - 1)
-                )
                 
-                if not is_escalating and not has_nonce_replacement:
+                # Modified to detect "clumps" and overall escalation rather than strict steps
+                # This captures the entire auction sequence, not just the final winner
+                price_spread = np.max(gas_prices) / (np.min(gas_prices) + 1e-9)
+                is_escalating = price_spread >= self.min_price_escalation
+                
+                # Also consider large groups as auctions (high contention)
+                is_large_clump = len(candidates) >= 4
+                
+                if not is_escalating and not has_nonce_replacement and not is_large_clump:
                     idx += 1
                     continue
                 
